@@ -1,0 +1,9 @@
+target/
+.git/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
