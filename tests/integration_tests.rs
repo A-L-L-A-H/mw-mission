@@ -1321,3 +1321,71 @@ async fn test_http_api_end_to_end() {
     assert_eq!(ack_status, StatusCode::OK);
     assert_eq!(ack_json["published"], json!(true));
 }
+
+#[tokio::test]
+async fn test_http_sse_telemetry_stream() {
+    let engine = create_memory_engine();
+    let router = build_router(engine);
+
+    let (enqueue_status, _) = send_json_request(
+        &router,
+        Method::POST,
+        "/api/jobs",
+        Some(json!({
+            "queue": "telemetry-test",
+            "payload_json": { "kind": "ping" }
+        })),
+    )
+    .await;
+    assert_eq!(enqueue_status, StatusCode::CREATED);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/events/stream")
+        .body(Body::empty())
+        .expect("build sse request");
+
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("execute sse request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "expected text/event-stream, got: {content_type}"
+    );
+
+    let mut body = response.into_body();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("initial sse frame timeout")
+        .expect("stream yielded frame")
+        .expect("valid body frame");
+
+    let chunk = frame.into_data().expect("data frame");
+    let raw_event = String::from_utf8(chunk.to_vec()).expect("utf8 sse event");
+    assert!(
+        raw_event.contains("event: telemetry"),
+        "expected telemetry event header, got: {raw_event}"
+    );
+
+    let data_line = raw_event
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .expect("sse data line");
+    let snapshot: Value = serde_json::from_str(data_line).expect("parse sse json payload");
+    assert!(snapshot["timestamp"].is_string());
+    assert_eq!(snapshot["stats"]["queued"], json!(1));
+    assert_eq!(snapshot["stats"]["leased"], json!(0));
+    assert_eq!(snapshot["stats"]["completed"], json!(0));
+    assert_eq!(snapshot["stats"]["dlq"], json!(0));
+    assert!(snapshot["stats"]["outbox"].as_u64().unwrap_or(0) >= 1);
+}

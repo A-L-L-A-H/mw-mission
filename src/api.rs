@@ -8,11 +8,16 @@ use crate::models::{
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::convert::Infallible;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -68,6 +73,7 @@ pub fn build_router(engine: MissionEngine) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/stats", get(stats_handler))
+        .route("/api/events/stream", get(events_stream_handler))
         .route("/api/missions", post(create_mission_handler))
         .route("/api/missions/{id}", get(get_mission_handler))
         .route("/api/jobs", post(enqueue_job_handler).get(list_jobs_handler))
@@ -109,10 +115,66 @@ async fn health_handler() -> Json<Value> {
     }))
 }
 
+#[derive(Debug, Serialize)]
+struct TelemetryStats {
+    queued: u64,
+    leased: u64,
+    completed: u64,
+    dlq: u64,
+    outbox: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TelemetrySnapshot {
+    timestamp: DateTime<Utc>,
+    stats: TelemetryStats,
+}
+
 async fn stats_handler(State(state): State<AppState>) -> Result<Json<BrokerStats>, MissionError> {
     let engine = state.engine;
     let stats = run_blocking(move || engine.get_stats()).await?;
     Ok(Json(stats))
+}
+
+async fn events_stream_handler(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
+    let engine = state.engine;
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            let engine_clone = engine.clone();
+            let stats = match run_blocking(move || engine_clone.get_stats()).await {
+                Ok(stats) => stats,
+                Err(_) => break,
+            };
+
+            let snapshot = TelemetrySnapshot {
+                timestamp: Utc::now(),
+                stats: TelemetryStats {
+                    queued: stats.jobs_queued,
+                    leased: stats.jobs_leased,
+                    completed: stats.jobs_completed,
+                    dlq: stats.jobs_dlq,
+                    outbox: stats.unpublished_outbox_events,
+                },
+            };
+
+            let event = match Event::default().event("telemetry").json_data(snapshot) {
+                Ok(event) => event,
+                Err(_) => break,
+            };
+
+            if tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
 async fn create_mission_handler(
