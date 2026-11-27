@@ -31,6 +31,10 @@ impl MissionEngine {
         Self { database }
     }
 
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
     pub fn enqueue_job(
         &self,
         request: EnqueueJobRequest,

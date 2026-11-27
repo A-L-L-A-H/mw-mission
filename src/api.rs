@@ -6,6 +6,9 @@ use crate::models::{
     EnqueueJobOutcome, EnqueueJobRequest, FailJobOutcome, FailJobRequest, HeartbeatJobRequest,
     JobRecord, LeaseJobRequest, ListJobsFilter, MissionDetail, OutboxEventRecord, ReapResult,
 };
+use crate::slo_burn::{
+    RecordSloOutcomeRequest, SloAlertDeliveryOutcome, SloBurnDetector, SloEvaluationReport,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -22,6 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Clone)]
 pub struct AppState {
     pub engine: MissionEngine,
+    pub slo_detector: SloBurnDetector,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,12 +67,26 @@ struct OutboxQueryParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct SloQueryParams {
+    queue: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
 
 pub fn build_router(engine: MissionEngine) -> Router {
-    let state = AppState { engine };
+    let slo_detector =
+        SloBurnDetector::new(engine.database().clone()).expect("init slo burn detector");
+    build_router_with_slo(engine, slo_detector)
+}
+
+pub fn build_router_with_slo(engine: MissionEngine, slo_detector: SloBurnDetector) -> Router {
+    let state = AppState {
+        engine,
+        slo_detector,
+    };
 
     Router::new()
         .route("/health", get(health_handler))
@@ -99,6 +117,9 @@ pub fn build_router(engine: MissionEngine) -> Router {
         .route("/api/outbox", get(list_outbox_handler))
         .route("/api/outbox/{id}/ack", post(ack_outbox_handler))
         .route("/api/reaper/run", post(run_reaper_handler))
+        .route("/api/slo/record", post(record_slo_outcome_handler))
+        .route("/api/slo/evaluate", get(evaluate_slo_handler))
+        .route("/api/slo/alert", post(alert_slo_handler))
         .with_state(state)
 }
 
@@ -359,4 +380,46 @@ async fn run_reaper_handler(
     let engine = state.engine;
     let result = run_blocking(move || engine.reap_expired_leases()).await?;
     Ok(Json(result))
+}
+
+async fn record_slo_outcome_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RecordSloOutcomeRequest>,
+) -> Result<(StatusCode, Json<Value>), MissionError> {
+    let detector = state.slo_detector;
+    let queue = payload.queue.unwrap_or_else(|| "default".to_string());
+    let job_id = payload.job_id;
+    let is_error = payload.is_error;
+    let now_ms = payload
+        .recorded_at_ms
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let event_id = run_blocking(move || {
+        detector.record_outcome_at(&queue, job_id.as_deref(), is_error, now_ms)
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "event_id": event_id, "recorded": true })),
+    ))
+}
+
+async fn evaluate_slo_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SloQueryParams>,
+) -> Result<Json<SloEvaluationReport>, MissionError> {
+    let detector = state.slo_detector;
+    let queue = query.queue;
+    let report = run_blocking(move || detector.evaluate(queue.as_deref())).await?;
+    Ok(Json(report))
+}
+
+async fn alert_slo_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SloQueryParams>,
+) -> Result<Json<SloAlertDeliveryOutcome>, MissionError> {
+    let outcome = state
+        .slo_detector
+        .evaluate_and_alert(query.queue.as_deref())
+        .await?;
+    Ok(Json(outcome))
 }
