@@ -1,7 +1,9 @@
 pub mod api;
 pub mod cron;
 pub mod db;
+pub mod dead_letter;
 pub mod engine;
 pub mod error;
 pub mod fleet_jobs;
 pub mod models;
+pub mod rid_auth;

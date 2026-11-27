@@ -85,6 +85,12 @@ pub fn build_router(engine: MissionEngine) -> Router {
         .route("/api/dlq", get(list_dlq_handler))
         .route("/api/dlq/{id}/replay", post(replay_dlq_handler))
         .route(
+            "/api/mission/jobs",
+            post(enqueue_job_handler).get(list_jobs_handler),
+        )
+        .route("/api/mission/dlq", get(list_dlq_handler))
+        .route("/api/mission/dlq/{id}/replay", post(replay_dlq_handler))
+        .route(
             "/api/crons",
             post(create_cron_handler).get(list_crons_handler),
         )
