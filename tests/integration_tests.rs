@@ -1389,3 +1389,50 @@ async fn test_http_sse_telemetry_stream() {
     assert_eq!(snapshot["stats"]["dlq"], json!(0));
     assert!(snapshot["stats"]["outbox"].as_u64().unwrap_or(0) >= 1);
 }
+
+#[tokio::test]
+async fn test_http_slo_burn_rate_record_evaluate_and_alert() {
+    let engine = create_memory_engine();
+    let router = build_router(engine);
+
+    for idx in 0..10 {
+        let is_err = idx < 2;
+        let (rec_status, rec_json) = send_json_request(
+            &router,
+            Method::POST,
+            "/api/slo/record",
+            Some(json!({
+                "queue": "slo-http-q",
+                "job_id": format!("job-{idx}"),
+                "is_error": is_err
+            })),
+        )
+        .await;
+        assert_eq!(rec_status, StatusCode::CREATED);
+        assert_eq!(rec_json["recorded"], json!(true));
+    }
+
+    let (eval_status, eval_json) =
+        send_json_request(&router, Method::GET, "/api/slo/evaluate?queue=slo-http-q", None).await;
+    assert_eq!(eval_status, StatusCode::OK);
+    assert_eq!(eval_json["queue"], json!("slo-http-q"));
+    assert_eq!(eval_json["fast_burn_triggered"], json!(true));
+    assert_eq!(eval_json["severity"], json!("fast_burn_critical"));
+
+    let (alert_status, alert_json) = send_json_request(
+        &router,
+        Method::POST,
+        "/api/slo/alert?queue=slo-http-q",
+        None,
+    )
+    .await;
+    assert_eq!(alert_status, StatusCode::OK);
+    assert_eq!(
+        alert_json["payload"]["event"],
+        json!("slo.burn_rate.alert")
+    );
+    assert_eq!(
+        alert_json["payload"]["severity"],
+        json!("fast_burn_critical")
+    );
+}

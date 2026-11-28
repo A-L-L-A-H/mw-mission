@@ -7,3 +7,4 @@ pub mod error;
 pub mod fleet_jobs;
 pub mod models;
 pub mod rid_auth;
+pub mod slo_burn;
